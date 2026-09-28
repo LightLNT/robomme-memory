@@ -17,6 +17,7 @@ import openpi.models.pi0_config as pi0_config
 import openpi.models.tokenizer as _tokenizer
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
@@ -30,6 +31,9 @@ import os
 from mme_vla_suite.models.integration import history_pi0
 from mme_vla_suite.policies.robomme_policy import RoboMMEInputs, RoboMMEOutputs
 from mme_vla_suite.models.config.utils import get_history_config
+from mme_vla_suite.training.rpm_weight_loader import merge_rpm_checkpoint_params
+from mme_vla_suite.training.rpm_weight_loader import merge_rpm_stage_a_params
+from mme_vla_suite.training.rpm_weight_loader import load_exact_checkpoint_params
 
 
 ModelType: TypeAlias = _model.ModelType
@@ -349,6 +353,11 @@ class RoboMMEDataConfig(DataConfigFactory):
                         "static_pos_emb": "static_pos_emb", # (b, l, d2)
                         "static_state_emb": "static_state_emb", # (b, l, d3)
                         "static_mask": "static_mask", # (b, l)
+                        "mem_gather": "mem_gather",
+                        "mem_mask": "mem_mask",
+                        "mem_mass": "mem_mass",
+                        "mem_kpos": "mem_kpos",
+                        "mem_qoffset": "mem_qoffset",
                         # recurrent memory
                         "recur_image_emb": "recur_image_emb", # (b, t, v, p, d1)
                         "recur_pos_emb": "recur_pos_emb", # (b, t, v, p, d2)
@@ -405,6 +414,11 @@ class LeRobotMMEVLARealRobotDataConfig(DataConfigFactory):
                         "static_pos_emb": "static_pos_emb", # (b, l, d2)
                         "static_state_emb": "static_state_emb", # (b, l, d3)
                         "static_mask": "static_mask", # (b, l)
+                        "mem_gather": "mem_gather",
+                        "mem_mask": "mem_mask",
+                        "mem_mass": "mem_mass",
+                        "mem_kpos": "mem_kpos",
+                        "mem_qoffset": "mem_qoffset",
                         # recurrent memory
                         "recur_image_emb": "recur_image_emb", # (b, t, v, p, d1)
                         "recur_pos_emb": "recur_pos_emb", # (b, t, v, p, d2)
@@ -448,6 +462,54 @@ class MMEVLAWeightLoader(WeightLoader):
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
         # Add all missing LoRA weights. And our new weights
         return _merge_params(loaded_params, params, missing_regex=".*")
+
+
+@dataclasses.dataclass(frozen=True)
+class RPMCheckpointWeightLoader(WeightLoader):
+    params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        loaded_params = _model.restore_params(
+            download.maybe_download(self.params_path), restore_type=np.ndarray
+        )
+        return merge_rpm_checkpoint_params(loaded_params, params)
+
+
+@dataclasses.dataclass(frozen=True)
+class RPMStageBWeightLoader(WeightLoader):
+    """Strictly combine a baseline model and Stage-A compressor checkpoint."""
+
+    baseline_params_path: str
+    compressor_params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        baseline_params = _model.restore_params(
+            download.maybe_download(self.baseline_params_path),
+            restore_type=np.ndarray,
+        )
+        compressor_params = _model.restore_params(
+            download.maybe_download(self.compressor_params_path),
+            restore_type=np.ndarray,
+        )
+        return merge_rpm_stage_a_params(
+            baseline_params,
+            compressor_params,
+            params,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class RPMFullCheckpointWeightLoader(WeightLoader):
+    """Load a materialized RPM checkpoint with no missing-parameter fallback."""
+
+    params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        loaded_params = _model.restore_params(
+            download.maybe_download(self.params_path),
+            restore_type=np.ndarray,
+        )
+        return load_exact_checkpoint_params(loaded_params, params)
 
 
 ####################### RoboMME #######################
@@ -551,9 +613,99 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
+@dataclasses.dataclass(frozen=True)
+class RPMStageAConfig(TrainConfig):
+    """Configuration for compressor-only read distillation."""
+
+    rpm_history_config: str = "perceptual-rpm-modul.yaml"
+    distill_layers: tuple[int, ...] = (2, 8, 17)
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.resume:
+            raise ValueError("RPM Stage A does not yet support optimizer-state resume")
+        if not isinstance(self.weight_loader, RPMCheckpointWeightLoader):
+            raise ValueError("RPM Stage A requires the strict RPMCheckpointWeightLoader")
+
+
+def rpm_stage_b_freeze_filter():
+    """Freeze vision and base VLM while leaving RPM and action modules trainable."""
+    return nnx.Any(
+        nnx_utils.PathRegex(r"PaliGemma/img/.*"),
+        nnx_utils.PathRegex(r"PaliGemma/llm/(embedder|final_norm)/.*"),
+        nnx_utils.PathRegex(
+            r"PaliGemma/llm/layers/(attn/(attn_vec_einsum|kv_einsum|q_einsum)/.*|"
+            r"mlp/.*|pre_attention_norm/.*|pre_ffw_norm/.*)"
+        ),
+    )
+
+
 OPENPI_DATA_HOME = os.getenv("OPENPI_DATA_HOME", "~/.cache/openpi")
 
 _CONFIGS = [
+    RPMStageAConfig(
+        name="rpm_stage_a",
+        model=history_pi0.HistoryPi0Config(
+            pi05=True,
+            action_horizon=20,
+            use_history=True,
+            history_config="perceptual-framesamp-modul.yaml",
+            discrete_state_input=False,
+        ),
+        data=RoboMMEDataConfig(
+            repo_id="robomme",
+            assets=AssetsConfig(assets_dir="runs/assets/mme_vla_suite"),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=0,
+            peak_lr=1e-4,
+            decay_steps=2_000,
+            decay_lr=1e-4,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=0.0, clip_gradient_norm=1.0),
+        weight_loader=RPMCheckpointWeightLoader(
+            tyro.MISSING,
+        ),
+        num_train_steps=2_000,
+        save_interval=500,
+        keep_period=500,
+        num_workers=4,
+        ema_decay=None,
+        fsdp_devices=1,
+    ),
+    TrainConfig(
+        name="rpm_stage_b",
+        model=history_pi0.HistoryPi0Config(
+            pi05=True,
+            action_horizon=20,
+            use_history=True,
+            history_config="perceptual-rpm-modul.yaml",
+            discrete_state_input=False,
+        ),
+        data=RoboMMEDataConfig(
+            repo_id="robomme",
+            assets=AssetsConfig(assets_dir="runs/assets/mme_vla_suite"),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=5e-5,
+            decay_steps=5_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        freeze_filter=rpm_stage_b_freeze_filter(),
+        weight_loader=RPMFullCheckpointWeightLoader(tyro.MISSING),
+        num_train_steps=5_000,
+        save_interval=1_000,
+        keep_period=1_000,
+        num_workers=4,
+        ema_decay=0.999,
+        fsdp_devices=1,
+    ),
     TrainConfig(
         name="pi05_baseline",
         model=history_pi0.HistoryPi0Config(

@@ -12,6 +12,7 @@ from collections import defaultdict
 
 from openpi.shared import image_tools
 from mme_vla_suite.shared.data_utils import *
+from mme_vla_suite.shared.rpm_sampling import make_plan
 
 
 def create_dict(indices):
@@ -318,6 +319,70 @@ class MemoryBuffer:
         # self._visualize_frame_sampling(indices_to_load, step_idx)
         history_feats = history_feats_gather_fn(indices_to_load, *args, **kwargs)
         return self._prepare_frame_sampling(history_feats, indices_to_load, token_budget, token_per_image)
+
+    def prepare_multires_frame_sampling(
+        self,
+        available_ids,
+        cutoff,
+        token_budget,
+        token_per_image,
+        max_frames,
+        history_feats_gather_fn,
+        *args,
+        **kwargs,
+    ):
+        if self.num_views != 1 or token_per_image != 16:
+            raise ValueError("RPM requires one view and 16 tokens per frame")
+
+        plan = make_plan(
+            available_ids,
+            cutoff,
+            mode="mixed",
+            max_frames=max_frames,
+            budget=token_budget,
+        )
+        indices_to_load = plan["frame_ids"][plan["frame_valid"]].tolist()
+        history_feats = history_feats_gather_fn(indices_to_load, *args, **kwargs)
+
+        image_emb = np.zeros(
+            (max_frames, self.num_views, token_per_image, self.img_emb_dim),
+            dtype=np.float32,
+        )
+        pos_emb = np.zeros(
+            (max_frames, self.num_views, token_per_image, self.pos_emb_dim),
+            dtype=np.float32,
+        )
+        state_emb = np.zeros((max_frames, self.state_emb_dim), dtype=np.float32)
+        if indices_to_load:
+            image_emb[:len(indices_to_load)] = self._load_emb(
+                history_feats, indices_to_load, "image_emb_4x4"
+            )
+            pos_emb[:len(indices_to_load)] = self._load_emb(
+                history_feats, indices_to_load, "pos_emb_4x4"
+            )
+            state_emb[:len(indices_to_load)] = self._load_emb(
+                history_feats, indices_to_load, "state_emb"
+            )
+
+        raw_mask = np.repeat(
+            plan["frame_valid"], self.num_views * token_per_image
+        )
+        image_emb = image_emb.reshape(-1, self.img_emb_dim)
+        pos_emb = pos_emb.reshape(-1, self.pos_emb_dim)
+        state_emb = np.repeat(
+            state_emb, self.num_views * token_per_image, axis=0
+        )
+        memory_meta = {
+            key: plan[key]
+            for key in (
+                "mem_gather",
+                "mem_mask",
+                "mem_mass",
+                "mem_kpos",
+                "mem_qoffset",
+            )
+        }
+        return image_emb, pos_emb, state_emb, raw_mask, memory_meta
 
 
     def _visualize_frame_sampling(self, indices_to_load, step_idx):

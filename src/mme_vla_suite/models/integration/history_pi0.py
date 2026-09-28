@@ -4,8 +4,10 @@ import os
 from typing import Any
 
 import einops
+import flax.traverse_util
 import flax.nnx as nnx
 import flax.nnx.bridge as nnx_bridge
+import flax.nnx.bridge.variables as nnx_bridge_variables
 import jax
 import jax.numpy as jnp
 from typing_extensions import override
@@ -27,6 +29,29 @@ from mme_vla_suite.models.config.utils import get_history_config
 
 
 logger = logging.getLogger("history-pi0")
+
+
+def _apply_with_read_capture(module: nnx_bridge.ToNNX, *args, **kwargs):
+    nnx_attrs = {
+        name: getattr(module, name)
+        for name in module.linen_attributes
+    }
+    variables = nnx_bridge_variables.nnx_attrs_to_linen_vars(nnx_attrs)
+    output, captured = module.module.apply(
+        variables,
+        *args,
+        **kwargs,
+        mutable=["rpm_reads"],
+    )
+    return output, captured["rpm_reads"]
+
+
+def _read_capture_value(captured, name):
+    flat_capture = flax.traverse_util.flatten_dict(captured, sep="/")
+    matches = [value for key, value in flat_capture.items() if key.endswith(name)]
+    if len(matches) != 1 or len(matches[0]) != 1:
+        raise ValueError(f"Expected one captured {name} value, got {len(matches)}")
+    return matches[0][0]
 
 
 def make_attn_mask(input_mask, mask_ar, mask_na=None):
@@ -122,24 +147,52 @@ class HistoryPi0Config(Pi0Config):
                         ),
                     )
                 elif self.history_config.representation_type == "perceptual":
+                    is_multires = (
+                        self.history_config.perceptual_memory.type
+                        == "multires_frame_sampling"
+                    )
+                    raw_capacity = (
+                        self.history_config.multires.raw_capacity
+                        if is_multires
+                        else self.history_config.budget
+                    )
+                    memory_meta_spec = {}
+                    if is_multires:
+                        memory_meta_spec = {
+                            "mem_gather": jax.ShapeDtypeStruct(
+                                [batch_size, self.history_config.budget], jnp.int32
+                            ),
+                            "mem_mask": jax.ShapeDtypeStruct(
+                                [batch_size, self.history_config.budget], jnp.bool_
+                            ),
+                            "mem_mass": jax.ShapeDtypeStruct(
+                                [batch_size, self.history_config.budget], jnp.float32
+                            ),
+                            "mem_kpos": jax.ShapeDtypeStruct(
+                                [batch_size, self.history_config.budget], jnp.float32
+                            ),
+                            "mem_qoffset": jax.ShapeDtypeStruct(
+                                [batch_size], jnp.float32
+                            ),
+                        }
                     observation_spec = HistAugObservation.from_base_obs(
                         base_obs_spec,
                         static_image_emb=jax.ShapeDtypeStruct(
                             [
                                 batch_size,
-                                self.history_config.budget,
+                                raw_capacity,
                                 self.history_config.memory_feature.img.input_dim,
                             ],
                             jnp.float32,
                         ),
                         static_mask=jax.ShapeDtypeStruct(
-                            [batch_size, self.history_config.budget],
+                            [batch_size, raw_capacity],
                             jnp.bool_,
                         ),
                         static_pos_emb=jax.ShapeDtypeStruct(
                             [
                                 batch_size,
-                                self.history_config.budget,
+                                raw_capacity,
                                 self.history_config.memory_feature.pos.input_dim,
                             ],
                             jnp.float32,
@@ -147,11 +200,12 @@ class HistoryPi0Config(Pi0Config):
                         static_state_emb=jax.ShapeDtypeStruct(
                             [
                                 batch_size,
-                                self.history_config.budget,
+                                raw_capacity,
                                 self.history_config.memory_feature.state.input_dim,
                             ],
                             jnp.float32,
                         ),
+                        **memory_meta_spec,
                     )
                 elif self.history_config.representation_type == "recurrent":
                     observation_spec = HistAugObservation.from_base_obs(
@@ -395,9 +449,18 @@ class HistoryPi0(BaseModel):
     def embed_memory(self, obs: HistAugObservation):
         if self.representation_type == "perceptual":
             tokens, _, stats = self.mem_encoder(
-                obs.static_image_emb, obs.static_pos_emb, obs.static_state_emb
+                obs.static_image_emb,
+                obs.static_pos_emb,
+                obs.static_state_emb,
+                mem_gather=obs.mem_gather,
+                mem_mask=obs.mem_mask,
             )
-            input_mask = obs.static_mask
+            input_mask = (
+                obs.mem_mask
+                if self.history_config.perceptual_memory.type
+                == "multires_frame_sampling"
+                else obs.static_mask
+            )
             ar_mask = [False] * tokens.shape[1]
             na_mask = [False] * tokens.shape[1]
         elif self.representation_type == "recurrent":
@@ -413,6 +476,107 @@ class HistoryPi0(BaseModel):
             na_mask = None
             stats = None
         return tokens, input_mask, ar_mask, na_mask, stats
+
+    def _memory_attention_metadata(self, obs: HistAugObservation):
+        if (
+            self.representation_type != "perceptual"
+            or self.history_config.perceptual_memory.type
+            != "multires_frame_sampling"
+        ):
+            return None, None, None
+
+        mem_mass = (
+            obs.mem_mass
+            if self.history_config.multires.proportional_attention
+            else None
+        )
+        use_virtual_positions = (
+            self.history_config.multires.position_mode == "virtual_uncompressed"
+        )
+        mem_kpos = obs.mem_kpos if use_virtual_positions else None
+        mem_qoffset = obs.mem_qoffset if use_virtual_positions else None
+        return mem_mass, mem_kpos, mem_qoffset
+
+    def capture_teacher_reads(
+        self,
+        observation: HistAugObservation,
+        actions: Actions,
+        noise: Actions,
+        time: at.Float[at.Array, " b"],
+        layer_indices: tuple[int, ...] = (2, 8, 17),
+    ):
+        if not self.pi05 or self.integration_type != "modulation":
+            raise ValueError("RPM teacher capture requires pi0.5 modulation")
+        if (
+            self.representation_type != "perceptual"
+            or self.history_config.perceptual_memory.type != "frame_sampling"
+        ):
+            raise ValueError("RPM teacher capture requires the frame-sampling baseline")
+        if actions.shape != noise.shape:
+            raise ValueError("Teacher actions and noise must have identical shapes")
+
+        observation = preprocess_observation(None, observation, train=False)
+        time_expanded = time[..., None, None]
+        noisy_actions = time_expanded * noise + (1 - time_expanded) * actions
+        prefix_tokens, prefix_mask, prefix_ar_mask, prefix_na_mask, _ = (
+            self.embed_prefix(observation)
+        )
+        suffix_tokens, suffix_mask, suffix_ar_mask, suffix_na_mask, adarms_cond = (
+            self.embed_suffix(observation, noisy_actions, time)
+        )
+        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
+        ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
+        na_mask = jnp.concatenate([prefix_na_mask, suffix_na_mask], axis=0)
+        attn_mask = make_attn_mask(input_mask, ar_mask, na_mask)
+        positions = jnp.cumsum(input_mask, axis=1) - 1
+        mem_seq, mem_mask, _, _, _ = self.embed_memory(observation)
+
+        _, captured = _apply_with_read_capture(
+            self.PaliGemma.llm,
+            [prefix_tokens, suffix_tokens],
+            mask=attn_mask,
+            positions=positions,
+            adarms_cond=[None, adarms_cond],
+            mem_seq=[None, mem_seq],
+            mem_mask=[None, mem_mask],
+            mem_mass=[None, None],
+            mem_kpos=[None, None],
+            mem_qoffset=[None, None],
+            capture_reads=True,
+        )
+        query_inputs = _read_capture_value(captured, "query_inputs")
+        teacher_reads = _read_capture_value(captured, "teacher_reads")
+        if max(layer_indices) >= query_inputs.shape[0]:
+            raise ValueError(
+                f"Distillation layers {layer_indices} exceed depth {query_inputs.shape[0]}"
+            )
+        layer_indices_array = jnp.asarray(layer_indices, dtype=jnp.int32)
+        query_inputs = jnp.take(query_inputs, layer_indices_array, axis=0)
+        teacher_reads = jnp.take(teacher_reads, layer_indices_array, axis=0)
+        query_inputs = query_inputs[:, :, -self.action_horizon :, :]
+        teacher_reads = teacher_reads[:, :, -self.action_horizon :, :]
+
+        if mem_seq.shape[1] != 32 * self.history_config.token_per_image:
+            raise ValueError("Teacher memory must contain 32 fine-grained frames")
+        encoded_frames = mem_seq.reshape(
+            mem_seq.shape[0],
+            32,
+            self.history_config.token_per_image,
+            mem_seq.shape[-1],
+        )
+        frame_valid = observation.static_mask.reshape(
+            observation.static_mask.shape[0],
+            32,
+            self.history_config.token_per_image,
+        ).all(axis=-1)
+        return {
+            "encoded_frames": jax.lax.stop_gradient(encoded_frames),
+            "query_inputs": query_inputs,
+            "teacher_reads": teacher_reads,
+            "query_valid": suffix_mask[:, -self.action_horizon :],
+            "frame_valid": frame_valid,
+            "layer_indices": layer_indices_array,
+        }
 
     @at.typecheck
     def embed_prefix(
@@ -615,6 +779,9 @@ class HistoryPi0(BaseModel):
             )
         elif self.integration_type == "modulation":
             mem_seq, mem_mask, _, _, stats = self.embed_memory(observation)
+            mem_mass, mem_kpos, mem_qoffset = self._memory_attention_metadata(
+                observation
+            )
             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
                 [prefix_tokens, suffix_tokens],
                 mask=attn_mask,
@@ -622,6 +789,9 @@ class HistoryPi0(BaseModel):
                 adarms_cond=[None, adarms_cond],
                 mem_seq=[None, mem_seq],
                 mem_mask=[None, mem_mask],
+                mem_mass=[None, mem_mass],
+                mem_kpos=[None, mem_kpos],
+                mem_qoffset=[None, mem_qoffset],
             )
         else:
             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
@@ -683,6 +853,9 @@ class HistoryPi0(BaseModel):
                 [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
             )
             mem_seq, mem_mask, _, _, _ = self.embed_memory(observation)
+            mem_mass, mem_kpos, mem_qoffset = self._memory_attention_metadata(
+                observation
+            )
             
         else:
             prefix_tokens, prefix_mask, prefix_ar_mask, prefix_na_mask, _ = self.embed_prefix(observation)
@@ -744,6 +917,9 @@ class HistoryPi0(BaseModel):
                     adarms_cond=[None, adarms_cond],
                     mem_seq=[None, mem_seq],
                     mem_mask=[None, mem_mask],
+                    mem_mass=[None, mem_mass],
+                    mem_kpos=[None, mem_kpos],
+                    mem_qoffset=[None, mem_qoffset],
                 )
             else:
                 (prefix_out, suffix_out), _ = self.PaliGemma.llm(

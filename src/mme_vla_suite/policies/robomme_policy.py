@@ -64,6 +64,11 @@ class RoboMMEInputs(transforms.DataTransformFn):
             "static_pos_emb": data.get("static_pos_emb", None), # (budget, d2)
             "static_state_emb": data.get("static_state_emb", None), # (budget, d3)
             "static_mask": data.get("static_mask", None), # (budget)
+            "mem_gather": data.get("mem_gather", None),
+            "mem_mask": data.get("mem_mask", None),
+            "mem_mass": data.get("mem_mass", None),
+            "mem_kpos": data.get("mem_kpos", None),
+            "mem_qoffset": data.get("mem_qoffset", None),
             # recurrent memory
             "recur_image_emb": data.get("recur_image_emb", None), # (max_recur_steps, views, p, d1)
             "recur_pos_emb": data.get("recur_pos_emb", None), # (max_recur_steps, views, p, d2)

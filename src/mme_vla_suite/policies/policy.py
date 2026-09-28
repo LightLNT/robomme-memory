@@ -147,6 +147,22 @@ class MME_VLA_Policy:
                 static_image_emb, static_pos_emb, static_state_emb, static_mask = \
                     self.mem_buffer.prepare_token_dropping(
                         self.step_idx, token_budget, history_feats_gather_fn)
+            elif self.config.perceptual_memory.type == "multires_frame_sampling":
+                (
+                    static_image_emb,
+                    static_pos_emb,
+                    static_state_emb,
+                    static_mask,
+                    memory_meta,
+                ) = self.mem_buffer.prepare_multires_frame_sampling(
+                    list(self.mem_buffer._history_feats.keys()),
+                    self.step_idx,
+                    token_budget,
+                    self.config.token_per_image,
+                    self.config.multires.max_frames,
+                    history_feats_gather_fn,
+                )
+                inputs.update(memory_meta)
             else:
                 token_per_image = self.config.token_per_image
                 static_image_emb, static_pos_emb, static_state_emb, static_mask = \

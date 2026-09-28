@@ -23,6 +23,11 @@ class HistAugObservation(_Observation):
     static_mask: at.Bool[at.Array, "b l1"] | None = None
     static_pos_emb: at.Float[at.Array, "b l1 d2"] | None = None
     static_state_emb: at.Float[at.Array, "b l1 d3"] | None = None
+    mem_gather: at.Int[at.Array, "b m"] | None = None
+    mem_mask: at.Bool[at.Array, "b m"] | None = None
+    mem_mass: at.Float[at.Array, "b m"] | None = None
+    mem_kpos: at.Float[at.Array, "b m"] | None = None
+    mem_qoffset: at.Float[at.Array, "b"] | None = None
 
     # for recurrent memory
     recur_image_emb: at.Float[at.Array, "b t v p d1"] | None = None  # left padded
@@ -51,6 +56,11 @@ class HistAugObservation(_Observation):
             static_mask=data.get("static_mask", None),
             static_pos_emb=data.get("static_pos_emb", None),
             static_state_emb=data.get("static_state_emb", None),
+            mem_gather=data.get("mem_gather", None),
+            mem_mask=data.get("mem_mask", None),
+            mem_mass=data.get("mem_mass", None),
+            mem_kpos=data.get("mem_kpos", None),
+            mem_qoffset=data.get("mem_qoffset", None),
             recur_image_emb=data.get("recur_image_emb", None),
             recur_mask=data.get("recur_mask", None),
             recur_pos_emb=data.get("recur_pos_emb", None),
@@ -67,6 +77,11 @@ class HistAugObservation(_Observation):
         result["static_mask"] = self.static_mask
         result["static_pos_emb"] = self.static_pos_emb
         result["static_state_emb"] = self.static_state_emb
+        result["mem_gather"] = self.mem_gather
+        result["mem_mask"] = self.mem_mask
+        result["mem_mass"] = self.mem_mass
+        result["mem_kpos"] = self.mem_kpos
+        result["mem_qoffset"] = self.mem_qoffset
         result["recur_image_emb"] = self.recur_image_emb
         result["recur_mask"] = self.recur_mask
         result["recur_pos_emb"] = self.recur_pos_emb
@@ -94,6 +109,11 @@ class HistAugObservation(_Observation):
         static_mask: at.Bool[ArrayT, "*b l"] | None = None,
         static_pos_emb: at.Float[ArrayT, "*b l d2"] | None = None,
         static_state_emb: at.Float[ArrayT, "*b l d3"] | None = None,
+        mem_gather: at.Int[ArrayT, "*b m"] | None = None,
+        mem_mask: at.Bool[ArrayT, "*b m"] | None = None,
+        mem_mass: at.Float[ArrayT, "*b m"] | None = None,
+        mem_kpos: at.Float[ArrayT, "*b m"] | None = None,
+        mem_qoffset: at.Float[ArrayT, "*b"] | None = None,
         recur_image_emb: at.Float[ArrayT, "*b t v p d1"] | None = None,
         recur_mask: at.Bool[ArrayT, "*b t"] | None = None,
         recur_pos_emb: at.Float[ArrayT, "*b t v p d2"] | None = None,
@@ -113,6 +133,11 @@ class HistAugObservation(_Observation):
             static_mask=static_mask,
             static_pos_emb=static_pos_emb,
             static_state_emb=static_state_emb,
+            mem_gather=mem_gather,
+            mem_mask=mem_mask,
+            mem_mass=mem_mass,
+            mem_kpos=mem_kpos,
+            mem_qoffset=mem_qoffset,
             recur_image_emb=recur_image_emb,
             recur_mask=recur_mask,
             recur_pos_emb=recur_pos_emb,
@@ -140,6 +165,11 @@ def preprocess_observation(
         static_mask=observation.static_mask,
         static_pos_emb=observation.static_pos_emb,
         static_state_emb=observation.static_state_emb,
+        mem_gather=observation.mem_gather,
+        mem_mask=observation.mem_mask,
+        mem_mass=observation.mem_mass,
+        mem_kpos=observation.mem_kpos,
+        mem_qoffset=observation.mem_qoffset,
         recur_image_emb=observation.recur_image_emb,
         recur_mask=observation.recur_mask,
         recur_pos_emb=observation.recur_pos_emb,

@@ -54,6 +54,7 @@ class RoboMMEDataset(Dataset):
         self.action_horizon = action_horizon
         self.dataset = SampleDataset(dataset_path)
         self.feature_dir = Path(self.dataset.dataset_path) / "features"
+        self._episode_frame_ids = {}
 
         if self.history_config is not None:
             self.img_emb_dim = self.history_config.memory_feature.img.input_dim
@@ -118,6 +119,15 @@ class RoboMMEDataset(Dataset):
                 np_dict, idx = future.result()
                 history_feats[idx] = np_dict
         return history_feats
+
+    def _get_episode_frame_ids(self, epis_idx: int) -> list[int]:
+        if epis_idx not in self._episode_frame_ids:
+            episode_dir = self.feature_dir / f"episode_{epis_idx}"
+            self._episode_frame_ids[epis_idx] = sorted(
+                int(path.stem.removeprefix("token_emb_"))
+                for path in episode_dir.glob("token_emb_*.npy")
+            )
+        return self._episode_frame_ids[epis_idx]
     
     
     def prepare_token_drop(self, epis_idx, step_idx):
@@ -136,6 +146,17 @@ class RoboMMEDataset(Dataset):
         return self.mem_buffer.prepare_frame_sampling(
             step_idx, token_budget, token_per_image, self._gather_history_feat, 
             epis_idx=epis_idx)
+
+    def prepare_multires_frame_sampling(self, epis_idx, step_idx):
+        return self.mem_buffer.prepare_multires_frame_sampling(
+            self._get_episode_frame_ids(epis_idx),
+            step_idx,
+            self.history_config.budget,
+            self.history_config.token_per_image,
+            self.history_config.multires.max_frames,
+            self._gather_history_feat,
+            epis_idx=epis_idx,
+        )
 
 
     
@@ -223,6 +244,15 @@ class RoboMMEDataset(Dataset):
                         static_state_emb,
                         static_mask, # >=64
                     ) = self.prepare_token_drop(epis_idx, step_idx)
+                elif self.history_config.perceptual_memory.type == "multires_frame_sampling":
+                    (
+                        static_img_emb,
+                        static_pos_emb,
+                        static_state_emb,
+                        static_mask,
+                        memory_meta,
+                    ) = self.prepare_multires_frame_sampling(epis_idx, step_idx)
+                    data.update(memory_meta)
                 else:
                     (
                         static_img_emb,
@@ -260,6 +290,11 @@ class RoboMMEDataset(Dataset):
             "static_pos_emb",
             "static_state_emb",
             "static_mask",
+            "mem_gather",
+            "mem_mask",
+            "mem_mass",
+            "mem_kpos",
+            "mem_qoffset",
             
             "recur_image_emb",
             "recur_pos_emb",

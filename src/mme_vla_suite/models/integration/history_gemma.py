@@ -48,7 +48,15 @@ class MemoryAttention(nn.Module):
     Use action sequence to attend memory sequence.
     """
     @nn.compact
-    def __call__(self, x, mem_seq, mem_mask):
+    def __call__(
+        self,
+        x,
+        mem_seq,
+        mem_mask,
+        mem_mass=None,
+        mem_kpos=None,
+        mem_qoffset=None,
+    ):
         # x: [B, T, D], mem_seq: [B, S, D], mem_mask: [B, S]
         B, mem_len, mem_width = mem_seq.shape
         B, x_len, x_width = x.shape
@@ -81,10 +89,18 @@ class MemoryAttention(nn.Module):
         mem_seq = rms_norm(mem_seq)
         k, v = kv_einsum("BSD,2KDH->2BSKH", mem_seq)
         
-        q_positions = einops.repeat(
-            jnp.arange(mem_len, x_len + mem_len), "t -> b t", b=B
-        )
-        k_positions = einops.repeat(jnp.arange(mem_len), "t -> b t", b=B)
+        if mem_qoffset is None:
+            q_positions = einops.repeat(
+                jnp.arange(mem_len, x_len + mem_len), "t -> b t", b=B
+            )
+        else:
+            q_positions = mem_qoffset[:, None] + jnp.arange(
+                x_len, dtype=jnp.float32
+            )[None, :]
+        if mem_kpos is None:
+            k_positions = einops.repeat(jnp.arange(mem_len), "t -> b t", b=B)
+        else:
+            k_positions = mem_kpos
         
         q = _apply_rope(q, positions=q_positions)
         q *= head_dim**-0.5
@@ -94,9 +110,17 @@ class MemoryAttention(nn.Module):
         logits = jnp.einsum(
             "BTKGH,BSKH->BKGTS", q, k, preferred_element_type=jnp.float32
         )
+        if mem_mass is not None:
+            logits = logits + jnp.log(jnp.maximum(mem_mass, 1.0))[
+                :, None, None, None, :
+            ]
         attn_mask = mem_mask[:, None, None, None, :]  # (B, 1, 1, 1, S)
         masked_logits = jnp.where(attn_mask, logits, -2.3819763e38)
         probs = jax.nn.softmax(masked_logits, axis=-1).astype(x.dtype)
+        probs = jnp.where(attn_mask, probs, 0)
+        probs = probs / jnp.maximum(
+            probs.sum(axis=-1, keepdims=True), jnp.asarray(1e-9, dtype=probs.dtype)
+        )
         encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
         encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
 
@@ -129,6 +153,10 @@ class HistoryBlock(nn.Module):
         adarms_cond,
         mem_seq,
         mem_mask,
+        mem_mass,
+        mem_kpos,
+        mem_qoffset,
+        capture_reads=False,
         deterministic=True,
     ):  # noqa: FBT002
 
@@ -175,7 +203,25 @@ class HistoryBlock(nn.Module):
             if x is not None:
                 # Add Memory Modulation before FFN
                 if i == len(xs) - 1 and self.integration_type == "modulation":
-                    mem_mod_vec = mem_attn(x, mem_seq[-1], mem_mask[-1])
+                    mem_mod_vec = mem_attn(
+                        x,
+                        mem_seq[-1],
+                        mem_mask[-1],
+                        mem_mass[-1],
+                        mem_kpos[-1],
+                        mem_qoffset[-1],
+                    )
+                    if capture_reads:
+                        self.sow(
+                            "rpm_reads",
+                            "query_inputs",
+                            jax.lax.stop_gradient(x),
+                        )
+                        self.sow(
+                            "rpm_reads",
+                            "teacher_reads",
+                            jax.lax.stop_gradient(mem_mod_vec),
+                        )
                     x = MemoryRMSNorm(name="mem_rms_norm_ffn")(x, mem_mod_vec)  
                 
                 name=_name("pre_ffw_norm", i) if self.integration_type != "expert" else _name("pre_ffw_norm", i-1)
@@ -235,12 +281,12 @@ class Module(nn.Module):
         block_cls = nn.remat(
             HistoryBlock,
             prevent_cse=False,
-            static_argnums=(7,),  # 0=xs, 5=decode
+            static_argnums=(10, 11),
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         self.layers = nn.scan(
             block_cls,
-            variable_axes={"params": 0},
+            variable_axes={"params": 0, "rpm_reads": 0},
             split_rngs={"params": True, "dropout": True},
             in_axes=(
                 0,
@@ -250,7 +296,11 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=mem_seq, 5=mem_mask, 6=deterministic
+                nn.broadcast,
+                nn.broadcast,
+                nn.broadcast,
+                nn.broadcast,
+            ),
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -278,6 +328,10 @@ class Module(nn.Module):
         kv_cache: KVCache | None = None,
         mem_seq: Sequence[at.Float[at.Array, "b lmem _d"] | None] | None = None,
         mem_mask: Sequence[at.Bool[at.Array, "b lmem"] | None] | None = None,
+        mem_mass: Sequence[at.Float[at.Array, "b lmem"] | None] | None = None,
+        mem_kpos: Sequence[at.Float[at.Array, "b lmem"] | None] | None = None,
+        mem_qoffset: Sequence[at.Float[at.Array, "b"] | None] | None = None,
+        capture_reads: bool = False,
         deterministic: bool = True,
     ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
@@ -293,6 +347,10 @@ class Module(nn.Module):
             adarms_cond,
             mem_seq,
             mem_mask,
+            mem_mass,
+            mem_kpos,
+            mem_qoffset,
+            capture_reads,
             deterministic,
         )
 
@@ -321,4 +379,8 @@ class Module(nn.Module):
                 for c, m in zip(self.configs, mem_mods, strict=True)
             ],
             mem_mask=[jnp.ones((1, 4), dtype=bool) if m else None for m in mem_mods],
+            mem_mass=[None] * len(self.configs),
+            mem_kpos=[None] * len(self.configs),
+            mem_qoffset=[None] * len(self.configs),
+            capture_reads=False,
         )
