@@ -64,6 +64,13 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Write visualization MP4s",
     )
+    parser.add_argument(
+        "--feature-profile",
+        type=str,
+        default="full",
+        choices=["full", "rpm_compact"],
+        help="Feature layout: full compatibility or compact RPM-only 4x4 features",
+    )
     return parser.parse_args()
 
 
@@ -77,6 +84,7 @@ if __name__ == "__main__":
             preprocessed_data_path=args.preprocessed_data_path,
             visualize=args.visualize,
             max_episodes=args.max_episodes,
+            feature_profile=args.feature_profile,
         )
         processor.run()
     elif args.dataset_type == "vlm_subgoal_qwenvl":

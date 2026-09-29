@@ -42,6 +42,18 @@ VIS_FPS_ORIGINAL = 30
 VIS_FPS_SAMPLED = 2
 VIS_FPS_TOKENDROP = 10
 
+FEATURE_PROFILES = {"full", "rpm_compact"}
+RPM_COMPACT_FEATURE_KEYS = ("image_emb_4x4", "state_emb")
+
+
+def select_history_features(features: dict, feature_profile: str) -> dict:
+    """Select the per-frame feature payload for the requested storage profile."""
+    if feature_profile == "full":
+        return features
+    if feature_profile == "rpm_compact":
+        return {key: features[key] for key in RPM_COMPACT_FEATURE_KEYS}
+    raise ValueError(f"Unknown feature profile: {feature_profile}")
+
 
 def get_action_chunk(
     data: h5py.Group, idx: int, horizon: int = ACTION_CHUNK_HORIZON
@@ -169,12 +181,18 @@ class DatasetProcessor:
         execution_horizon: int = 16,
         visualize: bool = False,
         max_episodes: int | None = None,
+        feature_profile: str = "full",
     ) -> None:
+        if feature_profile not in FEATURE_PROFILES:
+            raise ValueError(
+                f"feature_profile must be one of {sorted(FEATURE_PROFILES)}, got {feature_profile!r}"
+            )
         self.raw_data_path = raw_data_path
         self.dataset_path = preprocessed_data_path
         self.execution_horizon = execution_horizon
         self.visualize = visualize
         self.max_episodes = max_episodes
+        self.feature_profile = feature_profile
         if os.path.exists(self.dataset_path):
             shutil.rmtree(self.dataset_path)
         os.makedirs(self.dataset_path, exist_ok=True)
@@ -194,6 +212,11 @@ class DatasetProcessor:
             token_drop_stride=self.execution_horizon // 2,
             prepare_buffer=True,
         )
+        if self.feature_profile == "rpm_compact":
+            np.save(
+                os.path.join(self.feature_path, "pos_emb_4x4.npy"),
+                mem_buffer.pos_emb_dict["4x4"],
+            )
         exec_sample_id = 0
         total_sample_id = 0
 
@@ -219,6 +242,8 @@ class DatasetProcessor:
                     )
 
         stats = {"execution_samples": exec_sample_id, "total_samples": total_sample_id}
+        if self.feature_profile != "full":
+            stats["feature_profile"] = self.feature_profile
         with open(os.path.join(self.meta_path, "stats.json"), "w") as f:
             json.dump(stats, f, indent=2)
 
@@ -289,7 +314,10 @@ class DatasetProcessor:
 
             mem_buffer.add_buffer(image[None, None, ...], state[None, ...], [step_idx])
             feat_path = os.path.join(episode_feature_dir, f"token_emb_{step_idx}.npy")
-            np.save(feat_path, mem_buffer.get_history_feats(step_idx))
+            history_features = select_history_features(
+                mem_buffer.get_history_feats(step_idx), self.feature_profile
+            )
+            np.save(feat_path, history_features)
 
             if not is_video_demo:
                 pkl_path = os.path.join(self.data_path, f"{exec_sample_id}.pkl")

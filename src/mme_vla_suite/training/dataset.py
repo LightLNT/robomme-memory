@@ -54,6 +54,8 @@ class RoboMMEDataset(Dataset):
         self.action_horizon = action_horizon
         self.dataset = SampleDataset(dataset_path)
         self.feature_dir = Path(self.dataset.dataset_path) / "features"
+        self.feature_profile = self.dataset.stats.get("feature_profile", "full")
+        self._compact_pos_emb_4x4 = None
         self._episode_frame_ids = {}
 
         if self.history_config is not None:
@@ -84,6 +86,22 @@ class RoboMMEDataset(Dataset):
             else:
                 # symbolic memory does not need mem_buffer
                 self.mem_buffer = None
+
+            if self.feature_profile == "rpm_compact":
+                if self.history_config.representation_type == "recurrent":
+                    raise ValueError(
+                        "rpm_compact features do not support recurrent memory"
+                    )
+                if self.history_config.representation_type == "perceptual" and (
+                    self.num_views != 1
+                    or self.history_config.token_per_image != 16
+                    or self.history_config.perceptual_memory.type
+                    not in ["frame_sampling", "multires_frame_sampling"]
+                ):
+                    raise ValueError(
+                        "rpm_compact features require one-view, 16-token "
+                        "frame_sampling or multires_frame_sampling"
+                    )
         else:
             logger.info("=== Do not use history ===")
         
@@ -118,6 +136,15 @@ class RoboMMEDataset(Dataset):
             for future in as_completed(future_to_path):
                 np_dict, idx = future.result()
                 history_feats[idx] = np_dict
+
+        if self.feature_profile == "rpm_compact":
+            if self._compact_pos_emb_4x4 is None:
+                pos_path = self.feature_dir / "pos_emb_4x4.npy"
+                self._compact_pos_emb_4x4 = np.load(pos_path, mmap_mode="r")
+            for idx in indices_to_load:
+                history_feats[idx]["pos_emb_4x4"] = self._compact_pos_emb_4x4[
+                    idx
+                ][None, ...]
         return history_feats
 
     def _get_episode_frame_ids(self, epis_idx: int) -> list[int]:
